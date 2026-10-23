@@ -1,9 +1,29 @@
 require('dotenv').config();
 
-const { Client, Events, GatewayIntentBits, REST, Routes, ChannelType } = require('discord.js');
+const {
+  Client,
+  Events,
+  GatewayIntentBits,
+  REST,
+  Routes,
+  ChannelType,
+  EmbedBuilder,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+} = require('discord.js');
 const http = require('http');
 
 const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, PORT } = process.env;
+
+const EARLY_BIRD_ROLE_NAME = 'Early Bird';
+const EARLY_BIRD_LIMIT = 15;
+
+const CONTRIBUTOR_ROLE_NAME = 'Contributor';
+const CONTRIBUTOR_POST_LIMIT = 10;
+const CONTRIBUTOR_CHANNEL_NAMES = ['bug-reports', 'feature-requests'];
+
+const contributorCounts = new Map();
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -33,6 +53,18 @@ const commands = [
     description: 'How to report a bug or request a feature.',
   },
   {
+    name: 'search',
+    description: 'Search StepMania Online for packs.',
+    options: [
+      {
+        name: 'query',
+        description: 'Pack or song name to search for',
+        type: 3, // STRING
+        required: true,
+      },
+    ],
+  },
+  {
     name: 'tag',
     description: 'Assign a tag to this forum post (Founder only).',
     options: [
@@ -54,19 +86,401 @@ const rest = new REST({ version: '10' }).setToken(DISCORD_TOKEN);
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), {
       body: commands,
     });
-    console.log('Registered /ping command.');
+    console.log('Registered application commands.');
   } catch (error) {
     console.error(error);
   }
 })();
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+function earlyBirdCandidates(members) {
+  return [...members.values()]
+    .filter((member) => !member.user.bot && member.joinedTimestamp)
+    .sort(
+      (a, b) =>
+        a.joinedTimestamp - b.joinedTimestamp || a.id.localeCompare(b.id)
+    )
+    .slice(0, EARLY_BIRD_LIMIT);
+}
 
-client.once(Events.ClientReady, (readyClient) => {
+async function syncEarlyBirdRoles(guild) {
+  const role = guild.roles.cache.find(
+    (r) => r.name === EARLY_BIRD_ROLE_NAME
+  );
+
+  if (!role) {
+    console.warn(
+      `Role "${EARLY_BIRD_ROLE_NAME}" not found in ${guild.name}.`
+    );
+    return;
+  }
+
+  const members = await guild.members.fetch();
+
+  for (const member of earlyBirdCandidates(members)) {
+    if (member.roles.cache.has(role.id)) continue;
+
+    try {
+      await member.roles.add(role, 'Early Bird auto-role');
+      console.log(`Gave ${EARLY_BIRD_ROLE_NAME} to ${member.user.tag}`);
+    } catch (error) {
+      console.error(
+        `Failed to give ${EARLY_BIRD_ROLE_NAME} to ${member.user.tag}:`,
+        error
+      );
+    }
+  }
+}
+
+function getContributorCounts(guildId) {
+  if (!contributorCounts.has(guildId)) {
+    contributorCounts.set(guildId, new Map());
+  }
+  return contributorCounts.get(guildId);
+}
+
+function isContributorChannel(channel) {
+  if (!channel) return false;
+  if (CONTRIBUTOR_CHANNEL_NAMES.includes(channel.name)) return true;
+  return (
+    channel.isThread() &&
+    CONTRIBUTOR_CHANNEL_NAMES.includes(channel.parent?.name)
+  );
+}
+
+async function countChannelMessages(channel, counts) {
+  let before;
+
+  while (true) {
+    const messages = await channel.messages.fetch({
+      limit: 100,
+      ...(before ? { before } : {}),
+    });
+
+    if (messages.size === 0) break;
+
+    for (const message of messages.values()) {
+      if (message.author.bot) continue;
+      counts.set(
+        message.author.id,
+        (counts.get(message.author.id) || 0) + 1
+      );
+    }
+
+    before = messages.last().id;
+    if (messages.size < 100) break;
+  }
+}
+
+async function buildContributorCounts(guild) {
+  const counts = new Map();
+  const channels = guild.channels.cache.filter((channel) =>
+    CONTRIBUTOR_CHANNEL_NAMES.includes(channel.name)
+  );
+
+  for (const channel of channels.values()) {
+    if (channel.type === ChannelType.GuildForum) {
+      const active = await channel.threads.fetchActive();
+      for (const thread of active.threads.values()) {
+        await countChannelMessages(thread, counts);
+      }
+
+      let before;
+
+      while (true) {
+        const archived = await channel.threads.fetchArchived({
+          type: 'public',
+          limit: 100,
+          ...(before ? { before } : {}),
+        });
+
+        for (const thread of archived.threads.values()) {
+          await countChannelMessages(thread, counts);
+        }
+
+        if (!archived.hasMore || archived.threads.size === 0) break;
+        before = archived.threads.last().id;
+      }
+    } else if (channel.isTextBased()) {
+      await countChannelMessages(channel, counts);
+    }
+  }
+
+  return counts;
+}
+
+async function syncContributorRoles(guild, counts) {
+  const role = guild.roles.cache.find(
+    (r) => r.name === CONTRIBUTOR_ROLE_NAME
+  );
+
+  if (!role) {
+    console.warn(
+      `Role "${CONTRIBUTOR_ROLE_NAME}" not found in ${guild.name}.`
+    );
+    return;
+  }
+
+  for (const [userId, count] of counts) {
+    if (count < CONTRIBUTOR_POST_LIMIT) continue;
+
+    const member = await guild.members.fetch(userId).catch(() => null);
+
+    if (!member || member.user.bot || member.roles.cache.has(role.id)) {
+      continue;
+    }
+
+    try {
+      await member.roles.add(
+        role,
+        `${count} posts in #bug-reports/#feature-requests`
+      );
+      console.log(`Gave ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}`);
+    } catch (error) {
+      console.error(
+        `Failed to give ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}:`,
+        error
+      );
+    }
+  }
+}
+
+const STEPMANIA_BASE_URL = 'https://stepmaniaonline.net';
+const SEARCH_RESULT_LIMIT = 5;
+const SEARCH_SESSION_TTL = 15 * 60 * 1000;
+
+const searchSessions = new Map();
+
+function truncate(text, maxLength) {
+  if (!text || text.length <= maxLength) return text;
+  return `${text.slice(0, maxLength - 3)}...`;
+}
+
+async function fetchStepmaniaResults(query, type) {
+  const url = `${STEPMANIA_BASE_URL}/api/search/?query=${encodeURIComponent(query)}&type=${type}`;
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(10000),
+  });
+
+  if (!response.ok) {
+    throw new Error(`StepMania search failed with status ${response.status}`);
+  }
+
+  const data = await response.json();
+  return Array.isArray(data.results) ? data.results : [];
+}
+
+async function searchStepmania(query) {
+  const [byPackName, bySongTitle] = await Promise.all([
+    fetchStepmaniaResults(query, 'pack'),
+    fetchStepmaniaResults(query, 'title'),
+  ]);
+
+  const seen = new Set();
+  const results = [];
+
+  for (const pack of [...byPackName, ...bySongTitle]) {
+    if (!pack?.id || seen.has(pack.id)) continue;
+    seen.add(pack.id);
+    results.push(pack);
+  }
+
+  return results;
+}
+
+function cleanupSearchSessions() {
+  const now = Date.now();
+
+  for (const [id, session] of searchSessions) {
+    if (now - session.createdAt > SEARCH_SESSION_TTL) {
+      searchSessions.delete(id);
+    }
+  }
+}
+
+function buildSearchMessage(session, page) {
+  const totalPages = Math.ceil(
+    session.results.length / SEARCH_RESULT_LIMIT
+  );
+  const shown = session.results.slice(
+    page * SEARCH_RESULT_LIMIT,
+    (page + 1) * SEARCH_RESULT_LIMIT
+  );
+
+  const embed = new EmbedBuilder()
+    .setTitle(`StepMania results for "${truncate(session.query, 200)}"`)
+    .setURL(
+      `${STEPMANIA_BASE_URL}/search/title/${encodeURIComponent(session.query)}`
+    )
+    .setColor(0x5865f2)
+    .setFooter({
+      text:
+        totalPages > 1
+          ? `Page ${page + 1}/${totalPages} | ${session.results.length} packs - StepMania Online`
+          : `${session.results.length} packs - StepMania Online`,
+    });
+
+  for (const pack of shown) {
+    const types = Array.isArray(pack.type)
+      ? pack.type.join(', ')
+      : pack.type || 'unknown';
+    const matchingSongs =
+      Array.isArray(pack.matching_songs) && pack.matching_songs.length > 0
+        ? `\nMatching songs: ${truncate(
+            pack.matching_songs.slice(0, 3).join(', '),
+            200
+          )}`
+        : '';
+
+    embed.addFields({
+      name: truncate(pack.name, 256),
+      value: `${pack.songs_count ?? '?'} songs | ${types}${matchingSongs}\n[Open pack](${STEPMANIA_BASE_URL}/pack/${pack.id})`,
+    });
+  }
+
+  const components = [];
+  const packButtons = shown.map((pack) =>
+    new ButtonBuilder()
+      .setLabel(truncate(pack.name, 80))
+      .setStyle(ButtonStyle.Link)
+      .setURL(`${STEPMANIA_BASE_URL}/pack/${pack.id}`)
+  );
+
+  if (packButtons.length > 0) {
+    components.push(
+      new ActionRowBuilder().addComponents(packButtons)
+    );
+  }
+
+  if (totalPages > 1) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`search:page:${session.id}:${page - 1}`)
+          .setLabel('Previous')
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(page <= 0),
+        new ButtonBuilder()
+          .setCustomId(`search:page:${session.id}:${page}`)
+          .setLabel(`Page ${page + 1} of ${totalPages}`)
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true),
+        new ButtonBuilder()
+          .setCustomId(`search:page:${session.id}:${page + 1}`)
+          .setLabel('Next')
+          .setStyle(ButtonStyle.Primary)
+          .setDisabled(page >= totalPages - 1)
+      )
+    );
+  }
+
+  return { embeds: [embed], components };
+}
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+  ],
+});
+
+client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Logged in as ${readyClient.user.tag}`);
+
+  for (const guild of readyClient.guilds.cache.values()) {
+    try {
+      await syncEarlyBirdRoles(guild);
+    } catch (error) {
+      console.error(`Failed to sync ${EARLY_BIRD_ROLE_NAME} in ${guild.name}:`, error);
+    }
+
+    try {
+      const counts = await buildContributorCounts(guild);
+      contributorCounts.set(guild.id, counts);
+      await syncContributorRoles(guild, counts);
+    } catch (error) {
+      console.error(`Failed to sync ${CONTRIBUTOR_ROLE_NAME} in ${guild.name}:`, error);
+    }
+  }
+});
+
+client.on(Events.GuildMemberAdd, async (member) => {
+  if (member.user.bot) return;
+
+  try {
+    await syncEarlyBirdRoles(member.guild);
+  } catch (error) {
+    console.error(`Failed to sync ${EARLY_BIRD_ROLE_NAME} on join:`, error);
+  }
+});
+
+client.on(Events.MessageCreate, async (message) => {
+  if (message.author.bot || !message.inGuild()) return;
+  if (!isContributorChannel(message.channel)) return;
+
+  const counts = getContributorCounts(message.guild.id);
+  const count = (counts.get(message.author.id) || 0) + 1;
+  counts.set(message.author.id, count);
+
+  if (count < CONTRIBUTOR_POST_LIMIT) return;
+
+  const role = message.guild.roles.cache.find(
+    (r) => r.name === CONTRIBUTOR_ROLE_NAME
+  );
+
+  if (!role) return;
+
+  const member =
+    message.member ||
+    (await message.guild.members.fetch(message.author.id).catch(() => null));
+
+  if (!member || member.roles.cache.has(role.id)) return;
+
+  try {
+    await member.roles.add(
+      role,
+      `${count} posts in #bug-reports/#feature-requests`
+    );
+    console.log(`Gave ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}`);
+  } catch (error) {
+    console.error(
+      `Failed to give ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}:`,
+      error
+    );
+  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
+  if (interaction.isButton()) {
+    if (!interaction.customId.startsWith('search:page:')) return;
+
+    const [, , sessionId, pageRaw] = interaction.customId.split(':');
+    const session = searchSessions.get(sessionId);
+
+    if (!session || Date.now() - session.createdAt > SEARCH_SESSION_TTL) {
+      searchSessions.delete(sessionId);
+      await interaction.reply({
+        content: 'This search has expired. Run /search again.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const page = Number.parseInt(pageRaw, 10);
+    const totalPages = Math.ceil(
+      session.results.length / SEARCH_RESULT_LIMIT
+    );
+
+    if (!Number.isInteger(page) || page < 0 || page >= totalPages) {
+      await interaction.deferUpdate();
+      return;
+    }
+
+    await interaction.update(buildSearchMessage(session, page));
+    return;
+  }
+
   if (interaction.isAutocomplete()) {
     if (interaction.commandName !== 'tag') return;
 
@@ -117,6 +531,48 @@ client.on(Events.InteractionCreate, async (interaction) => {
       ].join('\n'),
       ephemeral: true,
     });
+    return;
+  }
+
+  if (interaction.commandName === 'search') {
+    const query = interaction.options.getString('query').trim();
+
+    if (query.length < 2) {
+      await interaction.reply({
+        content: 'Enter at least 2 characters to search.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const results = await searchStepmania(query);
+
+      if (results.length === 0) {
+        await interaction.editReply(`No packs found for "${query}".`);
+        return;
+      }
+
+      cleanupSearchSessions();
+
+      const session = {
+        id: interaction.id,
+        query,
+        results,
+        createdAt: Date.now(),
+      };
+      searchSessions.set(session.id, session);
+
+      await interaction.editReply(buildSearchMessage(session, 0));
+    } catch (error) {
+      console.error('StepMania search failed:', error);
+      await interaction.editReply(
+        'StepMania search failed. Try again later.'
+      );
+    }
+
     return;
   }
 
