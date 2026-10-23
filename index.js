@@ -292,44 +292,60 @@ function isStaff(member) {
   );
 }
 
-async function askNya(userMessage, userId) {
+async function askNya(userMessage, userId, isAdmin = false) {
   if (!GROQ_API_KEY) {
+    const err = 'Missing GROQ_API_KEY';
+    if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
     return '...';
   }
 
-  const response = await fetch(
-    'https://api.groq.com/openai/v1/chat/completions',
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
-        messages: [
-          { role: 'system', content: NYA_SYSTEM_PROMPT },
-          { role: 'user', content: userMessage },
-        ],
-        temperature: 0.8,
-        max_tokens: 256,
-      }),
-      signal: AbortSignal.timeout(15000),
+  try {
+    const response = await fetch(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'llama-3.1-8b-instant',
+          messages: [
+            { role: 'system', content: NYA_SYSTEM_PROMPT },
+            { role: 'user', content: userMessage },
+          ],
+          temperature: 0.8,
+          max_tokens: 256,
+        }),
+        signal: AbortSignal.timeout(15000),
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      console.error('Groq API error:', response.status, text);
+      const err = `Groq API error: ${response.status}`;
+      if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
+      return '...';
     }
-  );
 
-  if (!response.ok) {
+    const data = await response.json();
+    const content = data?.choices?.[0]?.message?.content;
+
+    if (!content || typeof content !== 'string') {
+      console.error('Groq API invalid response:', data);
+      const err = 'Groq API: invalid response';
+      if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
+      return '...';
+    }
+
+    return content.trim() || '...';
+  } catch (error) {
+    console.error('Groq request error:', error);
+    const err = error?.message || 'Request failed';
+    if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
     return '...';
   }
-
-  const data = await response.json();
-  const content = data?.choices?.[0]?.message?.content;
-
-  if (!content || typeof content !== 'string') {
-    return '...';
-  }
-
-  return content.trim() || '...';
 }
 
 function truncate(text, maxLength) {
@@ -563,11 +579,19 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   try {
-    const reply = await askNya(content, message.author.id);
+    const reply = await askNya(
+      content,
+      message.author.id,
+      member?.permissions?.has(PermissionFlagsBits.Administrator)
+    );
     await message.reply(reply);
   } catch (error) {
     console.error('Nya chat error:', error);
-    await message.reply('...');
+    if (member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+      await message.reply(`\`\`\`diff\n- ${error?.message || 'Unknown error'}\n\`\`\``);
+    } else {
+      await message.reply('...');
+    }
   }
 });
 
@@ -746,11 +770,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply();
 
     try {
-      const reply = await askNya(message, interaction.user.id);
+      const reply = await askNya(
+        message,
+        interaction.user.id,
+        member?.permissions?.has(PermissionFlagsBits.Administrator)
+      );
       await interaction.editReply(reply);
     } catch (error) {
       console.error('Nya chat error:', error);
-      await interaction.editReply('...');
+      if (member?.permissions?.has(PermissionFlagsBits.Administrator)) {
+        await interaction.editReply(`\`\`\`diff\n- ${error?.message || 'Unknown error'}\n\`\`\``);
+      } else {
+        await interaction.editReply('...');
+      }
     }
     return;
   }
