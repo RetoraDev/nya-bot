@@ -305,17 +305,15 @@ async function askNya(userMessage, userId, isAdmin = false) {
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${GROQ_API_KEY}`,
           'Content-Type': 'application/json',
+          Authorization: `Bearer ${GROQ_API_KEY}`,
         },
         body: JSON.stringify({
-          model: 'llama-3.1-8b-instant',
+          model: 'openai/gpt-oss-20b',
           messages: [
             { role: 'system', content: NYA_SYSTEM_PROMPT },
             { role: 'user', content: userMessage },
           ],
-          temperature: 0.8,
-          max_tokens: 256,
         }),
         signal: AbortSignal.timeout(15000),
       }
@@ -330,7 +328,7 @@ async function askNya(userMessage, userId, isAdmin = false) {
     }
 
     const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
+    const content = data.choices?.[0]?.message?.content;
 
     if (!content || typeof content !== 'string') {
       console.error('Groq API invalid response:', data);
