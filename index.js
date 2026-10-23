@@ -15,7 +15,7 @@ const {
 } = require('discord.js');
 const http = require('http');
 
-const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, PORT } = process.env;
+const { DISCORD_TOKEN, CLIENT_ID, GUILD_ID, PORT, GROQ_API_KEY } = process.env;
 
 const EARLY_BIRD_ROLE_NAME = 'Early Bird';
 const EARLY_BIRD_LIMIT = 15;
@@ -81,6 +81,18 @@ const commands = [
         type: 3, // STRING
         required: true,
         autocomplete: true,
+      },
+    ],
+  },
+  {
+    name: 'chat',
+    description: 'Talk to Nya.',
+    options: [
+      {
+        name: 'message',
+        description: 'Message for Nya',
+        type: 3, // STRING
+        required: true,
       },
     ],
   },
@@ -262,6 +274,64 @@ const SEARCH_SESSION_TTL = 15 * 60 * 1000;
 
 const searchSessions = new Map();
 
+const NYA_SYSTEM_PROMPT =
+  'You are Nya, a ~20 years old otaku girl who loves anime, games, and cute things. ' +
+  'You speak casually, playful but kind. Keep responses short and natural. ' +
+  'Use cute text like ^^, :3, and similar when fitting, but never use emojis. ' +
+  'Stay in character at all times.';
+
+const chatCooldowns = new Map();
+const CHAT_COOLDOWN_MS = 30 * 1000;
+
+function isStaff(member) {
+  if (!member?.permissions) return false;
+  return (
+    member.permissions.has(PermissionFlagsBits.Administrator) ||
+    member.permissions.has(PermissionFlagsBits.ModerateMembers) ||
+    member.permissions.has(PermissionFlagsBits.ManageGuild)
+  );
+}
+
+async function askNya(userMessage, userId) {
+  if (!GROQ_API_KEY) {
+    return '...';
+  }
+
+  const response = await fetch(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        messages: [
+          { role: 'system', content: NYA_SYSTEM_PROMPT },
+          { role: 'user', content: userMessage },
+        ],
+        temperature: 0.8,
+        max_tokens: 256,
+      }),
+      signal: AbortSignal.timeout(15000),
+    }
+  );
+
+  if (!response.ok) {
+    return '...';
+  }
+
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+
+  if (!content || typeof content !== 'string') {
+    return '...';
+  }
+
+  return content.trim() || '...';
+}
+
 function truncate(text, maxLength) {
   if (!text || text.length <= maxLength) return text;
   return `${text.slice(0, maxLength - 3)}...`;
@@ -402,6 +472,7 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
   ],
 });
 
@@ -429,37 +500,74 @@ client.on(Events.GuildMemberAdd, async (member) => {
 
 client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot || !message.inGuild()) return;
-  if (!isContributorChannel(message.channel)) return;
 
-  const counts = getContributorCounts(message.guild.id);
-  const count = (counts.get(message.author.id) || 0) + 1;
-  counts.set(message.author.id, count);
+  if (isContributorChannel(message.channel)) {
+    const counts = getContributorCounts(message.guild.id);
+    const count = (counts.get(message.author.id) || 0) + 1;
+    counts.set(message.author.id, count);
 
-  if (count < CONTRIBUTOR_POST_LIMIT) return;
+    if (count >= CONTRIBUTOR_POST_LIMIT) {
+      const role = message.guild.roles.cache.find(
+        (r) => r.name === CONTRIBUTOR_ROLE_NAME
+      );
 
-  const role = message.guild.roles.cache.find(
-    (r) => r.name === CONTRIBUTOR_ROLE_NAME
-  );
+      if (role) {
+        const member =
+          message.member ||
+          (await message.guild.members.fetch(message.author.id).catch(
+            () => null
+          ));
 
-  if (!role) return;
+        if (member && !member.roles.cache.has(role.id)) {
+          try {
+            await member.roles.add(
+              role,
+              `${count} posts in #bug-reports/#feature-requests`
+            );
+            console.log(`Gave ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}`);
+          } catch (error) {
+            console.error(
+              `Failed to give ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}:`,
+              error
+            );
+          }
+        }
+      }
+    }
+  }
+
+  const mentioned = message.mentions.users.has(client.user.id);
+  if (!mentioned) return;
 
   const member =
     message.member ||
     (await message.guild.members.fetch(message.author.id).catch(() => null));
+  const staff = isStaff(member);
 
-  if (!member || member.roles.cache.has(role.id)) return;
+  if (!staff) {
+    const last = chatCooldowns.get(message.author.id);
+    const now = Date.now();
+    if (last && now - last < CHAT_COOLDOWN_MS) {
+      await message.reply('...');
+      return;
+    }
+    chatCooldowns.set(message.author.id, now);
+  }
+
+  let content = message.content
+    .replace(new RegExp(`<@!?${client.user.id}>`, 'g'), '')
+    .trim();
+
+  if (!content) {
+    content = 'Say hi!';
+  }
 
   try {
-    await member.roles.add(
-      role,
-      `${count} posts in #bug-reports/#feature-requests`
-    );
-    console.log(`Gave ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}`);
+    const reply = await askNya(content, message.author.id);
+    await message.reply(reply);
   } catch (error) {
-    console.error(
-      `Failed to give ${CONTRIBUTOR_ROLE_NAME} to ${member.user.tag}:`,
-      error
-    );
+    console.error('Nya chat error:', error);
+    await message.reply('...');
   }
 });
 
@@ -608,6 +716,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
       );
     }
 
+    return;
+  }
+
+  if (interaction.commandName === 'chat') {
+    const member =
+      interaction.member ||
+      (await interaction.guild?.members
+        .fetch(interaction.user.id)
+        .catch(() => null));
+    const staff = isStaff(member);
+
+    if (!staff) {
+      const last = chatCooldowns.get(interaction.user.id);
+      const now = Date.now();
+      if (last && now - last < CHAT_COOLDOWN_MS) {
+        await interaction.reply({ content: '...', ephemeral: true });
+        return;
+      }
+      chatCooldowns.set(interaction.user.id, now);
+    }
+
+    const message = interaction.options.getString('message').trim();
+    if (!message) {
+      await interaction.reply({ content: '...', ephemeral: true });
+      return;
+    }
+
+    await interaction.deferReply();
+
+    try {
+      const reply = await askNya(message, interaction.user.id);
+      await interaction.editReply(reply);
+    } catch (error) {
+      console.error('Nya chat error:', error);
+      await interaction.editReply('...');
+    }
     return;
   }
 
