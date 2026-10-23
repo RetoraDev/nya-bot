@@ -24,7 +24,16 @@ const CONTRIBUTOR_ROLE_NAME = 'Contributor';
 const CONTRIBUTOR_POST_LIMIT = 10;
 const CONTRIBUTOR_CHANNEL_NAMES = ['bug-reports', 'feature-requests'];
 
+const CHAT_HISTORY_LIMIT_USER = 8;
+const CHAT_HISTORY_LIMIT_ADMIN = 25;
+
+const WELCOME_CHANNEL_NAME = 'general';
+const WELCOME_RATE_LIMIT = 3;
+const WELCOME_RATE_WINDOW_MS = 60 * 1000;
+
 const contributorCounts = new Map();
+const chatHistory = new Map();
+const welcomeTimestamps = [];
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -280,6 +289,14 @@ const NYA_SYSTEM_PROMPT =
   'Use cute text like ^^, :3, and similar when fitting, but never use emojis. ' +
   'Stay in character at all times.';
 
+const NYA_WELCOME_PROMPT =
+  'You are Nya, a ~20 years old otaku girl who loves anime, games, and cute things. ' +
+  'You speak casually, playful but kind. ' +
+  'Write a short, friendly welcome message for a new member joining the PadManiacs Discord server. ' +
+  'Mention PadManiacs is a StepMania clone and that they can check #welcome for where to post. ' +
+  'Keep it to 1-2 sentences. No emojis. Use cute text like ^^ or :3 sparingly. ' +
+  'Stay in character.';
+
 const chatCooldowns = new Map();
 const CHAT_COOLDOWN_MS = 30 * 1000;
 
@@ -292,12 +309,33 @@ function isStaff(member) {
   );
 }
 
+function getUserChatHistory(userId) {
+  if (!chatHistory.has(userId)) {
+    chatHistory.set(userId, []);
+  }
+  return chatHistory.get(userId);
+}
+
+function appendChatHistory(userId, role, content, limit) {
+  const history = getUserChatHistory(userId);
+  history.push({ role, content });
+
+  while (history.length > limit) {
+    history.shift();
+  }
+}
+
 async function askNya(userMessage, userId, isAdmin = false) {
   if (!GROQ_API_KEY) {
     const err = 'Missing GROQ_API_KEY';
     if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
     return '...';
   }
+
+  const limit = isAdmin ? CHAT_HISTORY_LIMIT_ADMIN : CHAT_HISTORY_LIMIT_USER;
+  appendChatHistory(userId, 'user', userMessage, limit);
+
+  const history = getUserChatHistory(userId);
 
   try {
     const response = await fetch(
@@ -312,7 +350,7 @@ async function askNya(userMessage, userId, isAdmin = false) {
           model: 'openai/gpt-oss-20b',
           messages: [
             { role: 'system', content: NYA_SYSTEM_PROMPT },
-            { role: 'user', content: userMessage },
+            ...history,
           ],
         }),
         signal: AbortSignal.timeout(15000),
@@ -337,13 +375,72 @@ async function askNya(userMessage, userId, isAdmin = false) {
       return '...';
     }
 
-    return content.trim() || '...';
+    const reply = content.trim() || '...';
+    appendChatHistory(userId, 'assistant', reply, limit);
+
+    return reply;
   } catch (error) {
     console.error('Groq request error:', error);
     const err = error?.message || 'Request failed';
     if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
     return '...';
   }
+}
+
+async function generateWelcome(member) {
+  if (!GROQ_API_KEY) return null;
+
+  try {
+    const response = await fetch(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: 'openai/gpt-oss-20b',
+          messages: [
+            { role: 'system', content: NYA_WELCOME_PROMPT },
+            { role: 'user', content: `New member: ${member.displayName}` },
+          ],
+          max_tokens: 80,
+          temperature: 0.7,
+        }),
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      console.error('Groq welcome error:', response.status, text);
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content || typeof content !== 'string') return null;
+    return content.trim() || null;
+  } catch (error) {
+    console.error('Groq welcome request error:', error);
+    return null;
+  }
+}
+
+function canSendWelcome() {
+  const now = Date.now();
+  while (
+    welcomeTimestamps.length > 0 &&
+    now - welcomeTimestamps[0] > WELCOME_RATE_WINDOW_MS
+  ) {
+    welcomeTimestamps.shift();
+  }
+  return welcomeTimestamps.length < WELCOME_RATE_LIMIT;
+}
+
+function markWelcomeSent() {
+  welcomeTimestamps.push(Date.now());
 }
 
 function truncate(text, maxLength) {
@@ -509,6 +606,30 @@ client.on(Events.GuildMemberAdd, async (member) => {
     await syncEarlyBirdRoles(member.guild);
   } catch (error) {
     console.error(`Failed to sync ${EARLY_BIRD_ROLE_NAME} on join:`, error);
+  }
+
+  if (!canSendWelcome()) {
+    console.log(`Welcome rate limit reached, skipping welcome for ${member.user.tag}`);
+    return;
+  }
+
+  const channel = member.guild.channels.cache.find(
+    (c) => c.name === WELCOME_CHANNEL_NAME && c.isTextBased()
+  );
+
+  if (!channel) {
+    console.warn(`Welcome channel "#${WELCOME_CHANNEL_NAME}" not found.`);
+    return;
+  }
+
+  try {
+    const welcome = await generateWelcome(member);
+    if (welcome) {
+      markWelcomeSent();
+      await channel.send(welcome);
+    }
+  } catch (error) {
+    console.error('Failed to send welcome message:', error);
   }
 });
 
