@@ -11,6 +11,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  PermissionFlagsBits,
 } = require('discord.js');
 const http = require('http');
 
@@ -65,6 +66,12 @@ const commands = [
     ],
   },
   {
+    name: 'refresh',
+    description: 'Refresh autoroles for this server (Admins only).',
+    default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+    dm_permission: false,
+  },
+  {
     name: 'tag',
     description: 'Assign a tag to this forum post (Founder only).',
     options: [
@@ -115,9 +122,14 @@ async function syncEarlyBirdRoles(guild) {
   }
 
   const members = await guild.members.fetch();
+  const founderRole = guild.roles.cache.find((r) => r.name === 'Founder');
 
   for (const member of earlyBirdCandidates(members)) {
     if (member.roles.cache.has(role.id)) continue;
+
+    if (founderRole && member.roles.cache.has(founderRole.id)) {
+      continue;
+    }
 
     try {
       await member.roles.add(role, 'Early Bird auto-role');
@@ -288,6 +300,14 @@ async function searchStepmania(query) {
   return results;
 }
 
+async function refreshAutoroles(guild) {
+  await syncEarlyBirdRoles(guild);
+
+  const counts = await buildContributorCounts(guild);
+  contributorCounts.set(guild.id, counts);
+  await syncContributorRoles(guild, counts);
+}
+
 function cleanupSearchSessions() {
   const now = Date.now();
 
@@ -390,17 +410,9 @@ client.once(Events.ClientReady, async (readyClient) => {
 
   for (const guild of readyClient.guilds.cache.values()) {
     try {
-      await syncEarlyBirdRoles(guild);
+      await refreshAutoroles(guild);
     } catch (error) {
-      console.error(`Failed to sync ${EARLY_BIRD_ROLE_NAME} in ${guild.name}:`, error);
-    }
-
-    try {
-      const counts = await buildContributorCounts(guild);
-      contributorCounts.set(guild.id, counts);
-      await syncContributorRoles(guild, counts);
-    } catch (error) {
-      console.error(`Failed to sync ${CONTRIBUTOR_ROLE_NAME} in ${guild.name}:`, error);
+      console.error(`Failed to refresh autoroles in ${guild.name}:`, error);
     }
   }
 });
@@ -531,6 +543,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
       ].join('\n'),
       ephemeral: true,
     });
+    return;
+  }
+
+  if (interaction.commandName === 'refresh') {
+    if (
+      !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+    ) {
+      await interaction.reply({
+        content: 'Only administrators can use this command.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      await refreshAutoroles(interaction.guild);
+      await interaction.editReply('Autoroles refreshed (Early Bird and Contributor).');
+    } catch (error) {
+      console.error('Failed to refresh autoroles:', error);
+      await interaction.editReply('Failed to refresh autoroles.');
+    }
     return;
   }
 
