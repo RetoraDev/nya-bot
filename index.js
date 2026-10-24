@@ -384,7 +384,11 @@ function getUserChatHistory(userId) {
 
 function appendChatHistory(userId, role, content, limit, messageId = null) {
   const history = getUserChatHistory(userId);
-  history.push({ role, content, messageId });
+  if (messageId) {
+    history.push({ role, content, messageId });
+  } else {
+    history.push({ role, content });
+  }
 
   while (history.length > limit) {
     history.shift();
@@ -1193,9 +1197,10 @@ async function askNya(userMessage, context) {
 
   try {
     const contextAwareUser = `${userMessage}\n\n[Context: This is a reply in an ongoing Discord conversation. Look at recent messages and only answer in relation to the actual question being asked. If it's a short follow-up like "what browser", infer from the conversation topic (PadManiaX/web game) instead of misinterpreting it.]`;
+    const sanitizedHistory = history.map((h) => ({ role: h.role, content: h.content }));
     let messages = [
       { role: 'system', content: systemContent },
-      ...history,
+      ...sanitizedHistory,
       { role: 'user', content: contextAwareUser },
     ];
 
