@@ -328,7 +328,320 @@ function appendChatHistory(userId, role, content, limit) {
   }
 }
 
-async function askNya(userMessage, userId, isAdmin = false) {
+const SERVER_MEMBERS_LIST_LIMIT = 30;
+const CHANNEL_LIST_LIMIT = 40;
+
+const CONTEXT_TOOL_NAMES = [
+  'getTime',
+  'getCurrentChannel',
+  'getUser',
+  'getMembers',
+  'getChannels',
+];
+
+const tools = {
+  getTime: () => {
+    const now = new Date();
+    const time = now.toLocaleTimeString([], {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+    return `The current date is ${now.toDateString()} and the time is ${time}.`;
+  },
+
+  getCurrentChannel: (context) => {
+    const channel = context.channel;
+    if (!channel) return 'The current channel is unknown.';
+
+    const parts = [`The current channel is #${channel.name}`];
+    if (channel.parent?.name) {
+      parts.push(`in the category "${channel.parent.name}"`);
+    }
+    if (channel.isThread?.()) {
+      parts.push('and it is a thread');
+    }
+    return `${parts.join(' ')}.`;
+  },
+
+  getUser: (context) => {
+    const user = context.user;
+    const member = context.member;
+
+    if (!user) return 'The current user is unknown.';
+
+    const roles = member?.roles?.cache
+      ? [...member.roles.cache.values()]
+          .filter((role) => role.name !== '@everyone')
+          .map((role) => role.name)
+          .slice(0, 15)
+      : [];
+
+    return (
+      `The user talking to you is ${user.username} ` +
+      `(display name "${member?.displayName || user.username}", id ${user.id}). ` +
+      `Admin: ${context.isAdmin ? 'yes' : 'no'}. ` +
+      `Staff: ${isStaff(member) ? 'yes' : 'no'}. ` +
+      `Roles: ${roles.length > 0 ? roles.join(', ') : 'none'}.`
+    );
+  },
+
+  getMembers: (context) => {
+    const guild = context.guild;
+    if (!guild) return 'No server member list is available.';
+
+    const members = [...guild.members.cache.values()].sort((a, b) =>
+      a.displayName.localeCompare(b.displayName)
+    );
+
+    if (members.length === 0) {
+      return 'The server member list is not loaded yet.';
+    }
+
+    const shown = members
+      .slice(0, SERVER_MEMBERS_LIST_LIMIT)
+      .map((member) => member.displayName);
+    const truncated =
+      members.length > SERVER_MEMBERS_LIST_LIMIT ? ', ...' : '';
+
+    return (
+      `The server has ${members.length} cached members. ` +
+      `First ${shown.length}: ${shown.join(', ')}${truncated}`
+    );
+  },
+
+  getChannels: (context) => {
+    const guild = context.guild;
+    if (!guild) return 'No channel list is available.';
+
+    const channels = [...guild.channels.cache.values()].sort(
+      (a, b) => a.position - b.position
+    );
+
+    const lines = channels.slice(0, CHANNEL_LIST_LIMIT).map((channel) => {
+      const isVoice =
+        channel.type === ChannelType.GuildVoice ||
+        channel.type === ChannelType.GuildStageVoice;
+      let state = isVoice ? 'voice' : 'text';
+      if (channel.nsfw) state += ', NSFW';
+      if (channel.rateLimitPerUser) {
+        state += `, slowmode ${channel.rateLimitPerUser}s`;
+      }
+      if (channel.isThread?.()) {
+        state += channel.archived ? ', archived' : ', active';
+      }
+
+      const category = channel.parent?.name
+        ? `category ${channel.parent.name}`
+        : 'no category';
+      const topic = channel.topic
+        ? ` - ${truncate(channel.topic, 80)}`
+        : '';
+
+      return `#${channel.name} (${state}, ${category})${topic}`;
+    });
+
+    const more =
+      channels.length > CHANNEL_LIST_LIMIT
+        ? `\n... ${channels.length - CHANNEL_LIST_LIMIT} more channels`
+        : '';
+
+    return `Channels (${channels.length}):\n${lines.join('\n')}${more}`;
+  },
+
+  searchSongs: async (context, query) => {
+    const term = (query || '').trim();
+    if (!term) return 'Song search failed: no query provided.';
+
+    try {
+      const results = await searchStepmania(term);
+      if (results.length === 0) {
+        return `No StepMania packs found for "${term}".`;
+      }
+
+      const list = results.slice(0, 5).map((pack) => {
+        const types = Array.isArray(pack.type)
+          ? pack.type.join(', ')
+          : pack.type || 'unknown';
+        return `${pack.name} (${pack.songs_count ?? '?'} songs, ${types})`;
+      });
+
+      return `StepMania packs matching "${term}": ${list.join('; ')}.`;
+    } catch (error) {
+      return `Song search failed: ${error.message}`;
+    }
+  },
+
+  manageChannel: async (context, args) => {
+    if (!context.isAdmin) {
+      return 'Permission denied: only admins can manage channels.';
+    }
+
+    const guild = context.guild;
+    if (!guild) {
+      return 'Channel management is only available in a server.';
+    }
+
+    const [rawAction, rawChannel, ...rest] = String(args || '')
+      .split('|')
+      .map((part) => part.trim());
+    const action = (rawAction || '').toLowerCase();
+    const channelRef = (rawChannel || '').replace(/^#/, '');
+    const value = rest.join('|').trim();
+
+    if (!action || !channelRef) {
+      return 'Channel management failed: use [manageChannel(action|channel|value)].';
+    }
+
+    const channel =
+      guild.channels.cache.get(channelRef) ||
+      guild.channels.cache.find(
+        (c) => c.name.toLowerCase() === channelRef.toLowerCase()
+      );
+
+    if (!channel) {
+      return `Channel management failed: channel "${channelRef}" not found.`;
+    }
+
+    try {
+      switch (action) {
+        case 'rename': {
+          const name = value
+            .toLowerCase()
+            .replace(/\s+/g, '-')
+            .replace(/[^a-z0-9\-_]/g, '')
+            .slice(0, 100);
+          if (!name) return 'Channel rename failed: invalid name.';
+          const oldName = channel.name;
+          await channel.setName(name, 'Nya channel management');
+          return `Renamed #${oldName} to #${name}.`;
+        }
+        case 'topic': {
+          if (!value) return 'Setting the topic failed: no topic provided.';
+          await channel.setTopic(value.slice(0, 1024), 'Nya channel management');
+          return `Updated the topic of #${channel.name}.`;
+        }
+        case 'slowmode': {
+          const seconds = Number.parseInt(value, 10);
+          if (!Number.isInteger(seconds) || seconds < 0 || seconds > 21600) {
+            return 'Slowmode change failed: use seconds between 0 and 21600.';
+          }
+          await channel.setRateLimitPerUser(seconds, 'Nya channel management');
+          return `Set slowmode in #${channel.name} to ${seconds} seconds.`;
+        }
+        case 'lock': {
+          await channel.permissionOverwrites.edit(guild.roles.everyone, {
+            SendMessages: false,
+          });
+          return `Locked #${channel.name} for everyone.`;
+        }
+        case 'unlock': {
+          await channel.permissionOverwrites.edit(guild.roles.everyone, {
+            SendMessages: null,
+          });
+          return `Unlocked #${channel.name}.`;
+        }
+        default:
+          return `Channel management failed: unknown action "${action}".`;
+      }
+    } catch (error) {
+      return `Channel management failed: ${error.message}`;
+    }
+  },
+};
+
+async function buildSystemContent(context) {
+  const results = await Promise.all(
+    CONTEXT_TOOL_NAMES.map(async (name) => {
+      try {
+        return await tools[name](context);
+      } catch (error) {
+        console.error(`Context tool ${name} failed:`, error);
+        return null;
+      }
+    })
+  );
+
+  const contextLines = results
+    .filter(Boolean)
+    .map((line) => `- ${line}`)
+    .join('\n');
+
+  return `${NYA_SYSTEM_PROMPT}
+
+Current context:
+${contextLines}
+
+Tool use:
+You can request a tool by writing its marker on its own line and waiting for the result before replying.
+- [searchSongs(query)] searches StepMania Online packs.
+- [manageChannel(rename|channel|new-name)] renames a channel (admin only).
+- [manageChannel(topic|channel|new-topic)] sets a channel topic (admin only).
+- [manageChannel(slowmode|channel|seconds)] sets slowmode, 0-21600 (admin only).
+- [manageChannel(lock|channel)] denies Send Messages to everyone (admin only).
+- [manageChannel(unlock|channel)] restores Send Messages (admin only).
+Only use manageChannel when the user asking is an admin, and never claim a channel change happened unless a tool result confirms it.`;
+}
+
+async function callGroq(messages) {
+  const response = await fetch(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-20b',
+        messages,
+      }),
+      signal: AbortSignal.timeout(15000),
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(`Groq API error: ${response.status} ${text.slice(0, 200)}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content;
+
+  if (!content || typeof content !== 'string') {
+    throw new Error('Groq API: invalid response');
+  }
+
+  return content.trim();
+}
+
+function parseToolCalls(text) {
+  const regex = /\[([a-zA-Z][a-zA-Z0-9]*)(?:\(([^)]*)\))?\]/g;
+
+  return [...text.matchAll(regex)]
+    .map((match) => ({
+      raw: match[0],
+      name: match[1],
+      arg: (match[2] || '').trim(),
+    }))
+    .filter((call) =>
+      Object.prototype.hasOwnProperty.call(tools, call.name)
+    );
+}
+
+async function runTool(call, context) {
+  const tool = tools[call.name];
+  if (!tool) return null;
+
+  if (call.name === 'searchSongs' || call.name === 'manageChannel') {
+    return await tool(context, call.arg);
+  }
+
+  return await tool(context);
+}
+
+async function askNya(userMessage, context) {
+  const { userId, isAdmin } = context;
+
   if (!GROQ_API_KEY) {
     const err = 'Missing GROQ_API_KEY';
     if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
@@ -337,47 +650,52 @@ async function askNya(userMessage, userId, isAdmin = false) {
 
   const limit = isAdmin ? CHAT_HISTORY_LIMIT_ADMIN : CHAT_HISTORY_LIMIT_USER;
   const history = getUserChatHistory(userId);
+  const systemContent = await buildSystemContent(context);
 
   try {
-    const response = await fetch(
-      'https://api.groq.com/openai/v1/chat/completions',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: 'openai/gpt-oss-20b',
-          messages: [
-            { role: 'system', content: NYA_SYSTEM_PROMPT },
-            ...history,
-            { role: 'user', content: userMessage },
-          ],
-        }),
-        signal: AbortSignal.timeout(15000),
+    let messages = [
+      { role: 'system', content: systemContent },
+      ...history,
+      { role: 'user', content: userMessage },
+    ];
+
+    const toolResults = new Map();
+    let reply = '';
+
+    for (let round = 0; round < 3; round += 1) {
+      reply = await callGroq(messages);
+      const calls = parseToolCalls(reply);
+
+      if (calls.length === 0) break;
+
+      const results = [];
+
+      for (const call of calls) {
+        const result = await runTool(call, context);
+        toolResults.set(call.raw, String(result));
+        results.push(`${call.raw} -> ${result}`);
       }
-    );
 
-    if (!response.ok) {
-      const text = await response.text().catch(() => '');
-      console.error('Groq API error:', response.status, text);
-      const err = `Groq API error: ${response.status}`;
-      if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
-      return '...';
+      messages = [
+        ...messages,
+        { role: 'assistant', content: reply },
+        {
+          role: 'user',
+          content: `Tool results:\n${results.join('\n')}\n\nNow answer the user naturally. Do not repeat tool markers unless you need another tool.`,
+        },
+      ];
     }
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
+    reply = reply
+      .replace(
+        /\[([a-zA-Z][a-zA-Z0-9]*)(?:\(([^)]*)\))?\]/g,
+        (match) => (toolResults.has(match) ? toolResults.get(match) : match)
+      )
+      .trim();
 
-    if (!content || typeof content !== 'string') {
-      console.error('Groq API invalid response:', data);
-      const err = 'Groq API: invalid response';
-      if (isAdmin) return `\`\`\`diff\n- ${err}\n\`\`\``;
-      return '...';
-    }
+    if (!reply) reply = '...';
+    if (reply.length > 2000) reply = `${reply.slice(0, 1997)}...`;
 
-    const reply = content.trim() || '...';
     appendChatHistory(userId, 'user', userMessage, limit);
     appendChatHistory(userId, 'assistant', reply, limit);
 
@@ -701,11 +1019,15 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   try {
-    const reply = await askNya(
-      content,
-      message.author.id,
-      member?.permissions?.has(PermissionFlagsBits.Administrator)
-    );
+    const reply = await askNya(content, {
+      userId: message.author.id,
+      user: message.author,
+      member,
+      guild: message.guild,
+      channel: message.channel,
+      isAdmin:
+        member?.permissions?.has(PermissionFlagsBits.Administrator) ?? false,
+    });
     await message.reply(reply);
   } catch (error) {
     console.error('Nya chat error:', error);
@@ -892,11 +1214,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply();
 
     try {
-      const reply = await askNya(
-        message,
-        interaction.user.id,
-        member?.permissions?.has(PermissionFlagsBits.Administrator)
-      );
+      const reply = await askNya(message, {
+        userId: interaction.user.id,
+        user: interaction.user,
+        member,
+        guild: interaction.guild,
+        channel: interaction.channel,
+        isAdmin:
+          member?.permissions?.has(PermissionFlagsBits.Administrator) ?? false,
+      });
       await interaction.editReply(reply);
     } catch (error) {
       console.error('Nya chat error:', error);
