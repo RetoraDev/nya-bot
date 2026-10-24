@@ -549,6 +549,56 @@ const tools = {
   },
 };
 
+const TOOL_DEFINITIONS = [
+  {
+    type: 'function',
+    function: {
+      name: 'searchSongs',
+      description: 'Search StepMania Online for packs matching a query.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Pack or song name to search for',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'manageChannel',
+      description:
+        'Admin-only channel management: rename, set topic, set slowmode, lock, or unlock.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['rename', 'topic', 'slowmode', 'lock', 'unlock'],
+            description: 'Action to perform',
+          },
+          channel: {
+            type: 'string',
+            description: 'Channel name or id',
+          },
+          value: {
+            type: 'string',
+            description:
+              'New name, new topic, or slowmode seconds. Omit for lock/unlock.',
+          },
+        },
+        required: ['action', 'channel'],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
 async function buildSystemContent(context) {
   const results = await Promise.all(
     CONTEXT_TOOL_NAMES.map(async (name) => {
@@ -572,7 +622,8 @@ Current context:
 ${contextLines}
 
 Tool use:
-You can request a tool by writing its marker on its own line and waiting for the result before replying.
+Use the provided functions whenever you need live or parameterized data, such as song search or channel management.
+If function calling is unavailable, you may write a marker on its own line instead and wait for the result:
 - [searchSongs(query)] searches StepMania Online packs.
 - [manageChannel(rename|channel|new-name)] renames a channel (admin only).
 - [manageChannel(topic|channel|new-topic)] sets a channel topic (admin only).
@@ -594,6 +645,8 @@ async function callGroq(messages) {
       body: JSON.stringify({
         model: 'openai/gpt-oss-20b',
         messages,
+        tools: TOOL_DEFINITIONS,
+        tool_choice: 'auto',
       }),
       signal: AbortSignal.timeout(15000),
     }
@@ -605,13 +658,17 @@ async function callGroq(messages) {
   }
 
   const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
+  const message = data.choices?.[0]?.message;
 
-  if (!content || typeof content !== 'string') {
+  if (
+    !message ||
+    (!Array.isArray(message.tool_calls) &&
+      (typeof message.content !== 'string' || message.content.length === 0))
+  ) {
     throw new Error('Groq API: invalid response');
   }
 
-  return content.trim();
+  return message;
 }
 
 function parseToolCalls(text) {
@@ -639,6 +696,31 @@ async function runTool(call, context) {
   return await tool(context);
 }
 
+async function runNativeTool(call, context) {
+  const name = call.function?.name;
+  if (!Object.prototype.hasOwnProperty.call(tools, name)) {
+    return 'Tool unavailable.';
+  }
+
+  let args = {};
+  try {
+    args = JSON.parse(call.function?.arguments || '{}');
+  } catch {
+    args = {};
+  }
+
+  if (name === 'searchSongs') {
+    return await tools.searchSongs(context, args.query || '');
+  }
+
+  if (name === 'manageChannel') {
+    const parts = [args.action || '', args.channel || '', args.value || ''];
+    return await tools.manageChannel(context, parts.join('|'));
+  }
+
+  return await tools[name](context);
+}
+
 async function askNya(userMessage, context) {
   const { userId, isAdmin } = context;
 
@@ -663,7 +745,32 @@ async function askNya(userMessage, context) {
     let reply = '';
 
     for (let round = 0; round < 3; round += 1) {
-      reply = await callGroq(messages);
+      const message = await callGroq(messages);
+      const nativeCalls = Array.isArray(message.tool_calls)
+        ? message.tool_calls
+        : [];
+
+      if (nativeCalls.length > 0) {
+        messages.push({
+          role: 'assistant',
+          content: message.content ?? null,
+          tool_calls: message.tool_calls,
+        });
+
+        for (const call of nativeCalls) {
+          const result = await runNativeTool(call, context);
+          messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: String(result ?? 'Tool unavailable.'),
+          });
+        }
+
+        reply = message.content || '';
+        continue;
+      }
+
+      reply = (message.content || '').trim();
       const calls = parseToolCalls(reply);
 
       if (calls.length === 0) break;
