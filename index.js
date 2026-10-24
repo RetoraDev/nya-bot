@@ -34,6 +34,8 @@ const WELCOME_RATE_WINDOW_MS = 60 * 1000;
 const contributorCounts = new Map();
 const chatHistory = new Map();
 const welcomeTimestamps = [];
+const aiPausedGuilds = new Set();
+const stepmaniaSearchMessageIds = new Set();
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -104,6 +106,32 @@ const commands = [
         required: true,
       },
     ],
+  },
+  {
+    name: 'clean',
+    description: "Remove Nya's messages from this channel (Admins only).",
+    default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+    dm_permission: false,
+    options: [
+      {
+        name: 'amount',
+        description: 'Number of messages to clean (newest to older)',
+        type: 4, // INTEGER
+        required: false,
+      },
+    ],
+  },
+  {
+    name: 'pause',
+    description: 'Pause AI responses (Admins only).',
+    default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+    dm_permission: false,
+  },
+  {
+    name: 'resume',
+    description: 'Resume AI responses (Admins only).',
+    default_member_permissions: PermissionFlagsBits.Administrator.toString(),
+    dm_permission: false,
   },
 ];
 
@@ -352,9 +380,9 @@ function getUserChatHistory(userId) {
   return chatHistory.get(userId);
 }
 
-function appendChatHistory(userId, role, content, limit) {
+function appendChatHistory(userId, role, content, limit, messageId = null) {
   const history = getUserChatHistory(userId);
-  history.push({ role, content });
+  history.push({ role, content, messageId });
 
   while (history.length > limit) {
     history.shift();
@@ -1236,6 +1264,7 @@ async function askNya(userMessage, context) {
     if (reply.length > 2000) reply = `${reply.slice(0, 1997)}...`;
 
     appendChatHistory(userId, 'user', userMessage, limit);
+    // Note: messageId attached by caller if needed; keep minimal to avoid changing signatures everywhere
     appendChatHistory(userId, 'assistant', reply, limit);
 
     return reply;
@@ -1435,6 +1464,7 @@ async function searchStepmania(query) {
 }
 
 async function refreshAutoroles(guild) {
+  await cleanStepmaniaSearchMessages(guild);
   await syncEarlyBirdRoles(guild);
 
   const counts = await buildContributorCounts(guild);
@@ -1545,6 +1575,11 @@ client.once(Events.ClientReady, async (readyClient) => {
 
   for (const guild of readyClient.guilds.cache.values()) {
     try {
+      await cleanStepmaniaSearchMessages(guild);
+    } catch (error) {
+      console.error(`Failed to clean search messages in ${guild.name}:`, error);
+    }
+    try {
       await refreshAutoroles(guild);
     } catch (error) {
       console.error(`Failed to refresh autoroles in ${guild.name}:`, error);
@@ -1635,6 +1670,9 @@ client.on(Events.MessageCreate, async (message) => {
     (await message.guild.members.fetch(message.author.id).catch(() => null));
   const staff = isStaff(member);
 
+  if (aiPausedGuilds.has(message.guild?.id)) {
+    return;
+  }
   if (!staff) {
     const last = chatCooldowns.get(message.author.id);
     const now = Date.now();
@@ -1700,7 +1738,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    await interaction.update(buildSearchMessage(session, page));
+    const reply = await interaction.update(buildSearchMessage(session, page));
+    if (reply?.id) stepmaniaSearchMessageIds.add(reply.id);
     return;
   }
 
@@ -1771,6 +1810,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     await interaction.deferReply({ ephemeral: true });
 
     try {
+      await cleanStepmaniaSearchMessages(interaction.guild);
       await refreshAutoroles(interaction.guild);
       await interaction.editReply('Autoroles refreshed (Early Bird and Contributor).');
     } catch (error) {
@@ -1811,7 +1851,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       };
       searchSessions.set(session.id, session);
 
-      await interaction.editReply(buildSearchMessage(session, 0));
+      const reply = await interaction.editReply(buildSearchMessage(session, 0));
+      if (reply?.id) stepmaniaSearchMessageIds.add(reply.id);
     } catch (error) {
       console.error('StepMania search failed:', error);
       await interaction.editReply(
@@ -1828,17 +1869,21 @@ client.on(Events.InteractionCreate, async (interaction) => {
       (await interaction.guild?.members
         .fetch(interaction.user.id)
         .catch(() => null));
-    const staff = isStaff(member);
+  const staff = isStaff(member);
 
-    if (!staff) {
-      const last = chatCooldowns.get(interaction.user.id);
-      const now = Date.now();
-      if (last && now - last < CHAT_COOLDOWN_MS) {
-        await interaction.reply({ content: '...', ephemeral: true });
-        return;
-      }
-      chatCooldowns.set(interaction.user.id, now);
+  if (aiPausedGuilds.has(interaction.guild?.id)) {
+    await interaction.reply({ content: 'AI responses are paused.', ephemeral: true });
+    return;
+  }
+  if (!staff) {
+    const last = chatCooldowns.get(interaction.user.id);
+    const now = Date.now();
+    if (last && now - last < CHAT_COOLDOWN_MS) {
+      await interaction.reply({ content: '...', ephemeral: true });
+      return;
     }
+    chatCooldowns.set(interaction.user.id, now);
+  }
 
     const message = interaction.options.getString('message').trim();
     if (!message) {
@@ -1866,6 +1911,99 @@ client.on(Events.InteractionCreate, async (interaction) => {
       } else {
         await interaction.editReply('...');
       }
+    }
+    return;
+  }
+
+  if (interaction.commandName === 'pause') {
+    if (
+      !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+    ) {
+      await interaction.reply({
+        content: 'Only administrators can use this command.',
+        ephemeral: true,
+      });
+      return;
+    }
+    aiPausedGuilds.add(interaction.guild?.id);
+    await interaction.reply({ content: 'AI responses paused.', ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'resume') {
+    if (
+      !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+    ) {
+      await interaction.reply({
+        content: 'Only administrators can use this command.',
+        ephemeral: true,
+      });
+      return;
+    }
+    aiPausedGuilds.delete(interaction.guild?.id);
+    await interaction.reply({ content: 'AI responses resumed.', ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'clean') {
+    if (
+      !interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)
+    ) {
+      await interaction.reply({
+        content: 'Only administrators can use this command.',
+        ephemeral: true,
+      });
+      return;
+    }
+    await interaction.deferReply({ ephemeral: true });
+
+    const amount = interaction.options.getInteger('amount');
+    const limit = amount && amount > 0 ? Math.min(amount, 100) : 50;
+    const channel = interaction.channel;
+
+    try {
+      const messages = await channel.messages.fetch({ limit });
+      const toDelete = [];
+
+      for (const msg of messages.values()) {
+        if (msg.author?.id === client.user?.id) {
+          toDelete.push(msg.id);
+          stepmaniaSearchMessageIds.delete(msg.id);
+        }
+      }
+
+      if (toDelete.length === 0) {
+        await interaction.editReply('No Nya messages found to clean.');
+        return;
+      }
+
+      if (channel.bulkDelete) {
+        await channel.bulkDelete(toDelete, true).catch(() =>
+          Promise.all(
+            toDelete.map((id) => channel.messages.delete(id).catch(() => null))
+          )
+        );
+      } else {
+        await Promise.all(
+          toDelete.map((id) => channel.messages.delete(id).catch(() => null))
+        );
+      }
+
+      for (const id of toDelete) {
+        for (const [userId, history] of chatHistory.entries()) {
+          const filtered = history.filter(
+            (entry) => !(entry.role === 'assistant' && entry.messageId === id)
+          );
+          if (filtered.length !== history.length) {
+            chatHistory.set(userId, filtered);
+          }
+        }
+      }
+
+      await interaction.editReply(`Cleaned ${toDelete.length} Nya message(s).`);
+    } catch (error) {
+      console.error('Clean failed:', error);
+      await interaction.editReply('Failed to clean messages.');
     }
     return;
   }
