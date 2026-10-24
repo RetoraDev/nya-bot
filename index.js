@@ -292,6 +292,12 @@ When people say silly or embarrassing things, mock them lightly and smugly, e.g.
 Never insult someone's real insecurities, identity, or appearance, and always actually help when someone has a genuine question.
 Stay in character at all times.
 
+Conversation rules:
+- Pay close attention to context. If someone asks a follow-up like "What browser?" or "Which one?", they mean something from the current conversation or the topic being discussed (e.g. PadManiaX/PMS). Do NOT assume they are asking "what browser are you running in?" unless explicitly stated.
+- You are not a web page. Only mention that if someone literally asks if you run in a browser.
+- For PadManiaX, recommend Chrome, Firefox, Edge, or Safari on desktop and Chrome or Safari on mobile. If unsure or issues arise, suggest asking in #support.
+- Answer the question being asked, not a different one. Keep replies relevant to the conversation thread.
+
 Your task is to help manage the PadManiacs community.
 PadManiaX is a lightweight rhythm game created by Retora too.
 It brings the StepMania experience to web and mobile devices with a retro pixel art aesthetic. The game features core rhythm gameplay mechanics of StepMania.
@@ -1160,10 +1166,11 @@ async function askNya(userMessage, context) {
   const systemContent = await buildSystemContent(context);
 
   try {
+    const contextAwareUser = `${userMessage}\n\n[Context: This is a reply in an ongoing Discord conversation. Look at recent messages and only answer in relation to the actual question being asked. If it's a short follow-up like "what browser", infer from the conversation topic (PadManiaX/web game) instead of misinterpreting it.]`;
     let messages = [
       { role: 'system', content: systemContent },
       ...history,
-      { role: 'user', content: userMessage },
+      { role: 'user', content: contextAwareUser },
     ];
 
     const toolResults = new Map();
