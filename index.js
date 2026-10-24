@@ -305,6 +305,8 @@ async function syncContributorRoles(guild, counts) {
   }
 }
 
+const RETORA_USER_NAME = process.env.RETORA_USER_NAME || 're.tora';
+
 const STEPMANIA_BASE_URL = 'https://stepmaniaonline.net';
 const SEARCH_RESULT_LIMIT = 5;
 const SEARCH_SESSION_TTL = 15 * 60 * 1000;
@@ -566,9 +568,6 @@ async function searchDuckDuckGo(query) {
 }
 const CHANNEL_LIST_LIMIT = 40;
 
-const RETORA_USER_NAME = process.env.RETORA_USER_NAME || 're.tora';
-const RETORA_USER_ID = process.env.RETORA_USER_ID || '';
-
 const CONTEXT_TOOL_NAMES = [
   'getTime',
   'getCurrentChannel',
@@ -608,7 +607,6 @@ const tools = {
     if (!user) return 'The current user is unknown.';
 
     const isRetora =
-      (RETORA_USER_ID && user.id === RETORA_USER_ID) ||
       user.username === RETORA_USER_NAME ||
       user.tag === RETORA_USER_NAME ||
       member?.displayName === RETORA_USER_NAME;
@@ -1035,7 +1033,7 @@ ${contextLines}
 Important mentions from this server (use these exact forms when referring to them):
 - #general should be referenced as <#${context.channel?.guild?.channels?.cache?.find?.((c)=>c.name==='general')?.id || 'CHANNEL_ID'}> when talking about it. Prefer using the channel mention from context.
 - @Early Bird role: use <@&ROLE_ID> if known; look for "Early Bird" in roles and mention it as a role mention.
-- ${RETORA_USER_NAME} is the creator: treat as <@${RETORA_USER_ID || 'USER_ID'}> if known from context/user info.
+- ${RETORA_USER_NAME} is the creator of PadManiacs. Treat them with respect.
 
 Tool use:
 Use the provided functions whenever you need live or parameterized data, such as song search, web search, moderation, or channel management.
