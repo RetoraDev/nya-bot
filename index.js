@@ -294,7 +294,12 @@ Stay in character at all times.
 
 Your task is to help manage the PadManiacs community.
 PadManiaX is a lightweight rhythm game created by Retora too.
-It brings the StepMania experience to web and mobile devices with a retro pixel art aesthetic. The game features core rhythm gameplay mechanics of StepMania.`;
+It brings the StepMania experience to web and mobile devices with a retro pixel art aesthetic. The game features core rhythm gameplay mechanics of StepMania.
+
+Discord mention rules:
+- Always use real Discord mentions when referring to people, roles, or channels. Use <@USER_ID> for users, <@&ROLE_ID> for roles, <#CHANNEL_ID> for channels.
+- If you want to refer to #general, @Early Bird, or ${RETORA_USER_NAME}, use their proper mention forms from context instead of plain text.
+- Never output "#general" or "@Early Bird" as raw plain text if you know the actual mention. Use the mention syntax so Discord renders them as linked text.`;
 
 const NYA_WELCOME_PROMPT =
   'You are Nya, a ~20 years old otaku girl who loves anime, rhythm games, and cute things. ' +
@@ -527,6 +532,9 @@ async function searchDuckDuckGo(query) {
 }
 const CHANNEL_LIST_LIMIT = 40;
 
+const RETORA_USER_NAME = process.env.RETORA_USER_NAME || 're.tora';
+const RETORA_USER_ID = process.env.RETORA_USER_ID || '';
+
 const CONTEXT_TOOL_NAMES = [
   'getTime',
   'getCurrentChannel',
@@ -565,6 +573,12 @@ const tools = {
 
     if (!user) return 'The current user is unknown.';
 
+    const isRetora =
+      (RETORA_USER_ID && user.id === RETORA_USER_ID) ||
+      user.username === RETORA_USER_NAME ||
+      user.tag === RETORA_USER_NAME ||
+      member?.displayName === RETORA_USER_NAME;
+
     const roles = member?.roles?.cache
       ? [...member.roles.cache.values()]
           .filter((role) => role.name !== '@everyone')
@@ -574,10 +588,11 @@ const tools = {
 
     return (
       `The user talking to you is ${user.username} ` +
-      `(display name "${member?.displayName || user.username}", id ${user.id}). ` +
-      `Admin: ${context.isAdmin ? 'yes' : 'no'}. ` +
-      `Staff: ${isStaff(member) ? 'yes' : 'no'}. ` +
-      `Roles: ${roles.length > 0 ? roles.join(', ') : 'none'}.`
+      `(ID: ${user.id}), display name "${member?.displayName || user.username}". ` +
+      (isRetora
+        ? `This is ${RETORA_USER_NAME}, creator of PadManiacs. `
+        : '') +
+      `Roles: ${roles.length ? roles.join(', ') : 'none'}.`
     );
   },
 
@@ -978,8 +993,15 @@ async function buildSystemContent(context) {
 
   return `${NYA_SYSTEM_PROMPT}
 
+You know ${RETORA_USER_NAME} is the creator of PadManiacs. If ${RETORA_USER_NAME} speaks to you, be a little more respectful and less mean to him, but still keep your sassy tsundere personality.
+
 Current context:
 ${contextLines}
+
+Important mentions from this server (use these exact forms when referring to them):
+- #general should be referenced as <#${context.channel?.guild?.channels?.cache?.find?.((c)=>c.name==='general')?.id || 'CHANNEL_ID'}> when talking about it. Prefer using the channel mention from context.
+- @Early Bird role: use <@&ROLE_ID> if known; look for "Early Bird" in roles and mention it as a role mention.
+- ${RETORA_USER_NAME} is the creator: treat as <@${RETORA_USER_ID || 'USER_ID'}> if known from context/user info.
 
 Tool use:
 Use the provided functions whenever you need live or parameterized data, such as song search, web search, moderation, or channel management.
