@@ -690,6 +690,101 @@ const tools = {
     }
   },
 
+  moderateUser: async (context, args) => {
+    if (!context.isAdmin) {
+      return 'Permission denied: only admins can moderate users.';
+    }
+
+    const guild = context.guild;
+    if (!guild) {
+      return 'Moderation is only available in a server.';
+    }
+
+    const [rawAction, rawUser, ...rest] = String(args || '')
+      .split('|')
+      .map((part) => part.trim());
+    const action = (rawAction || '').toLowerCase();
+    const userRef = (rawUser || '')
+      .replace(/^<@!?/, '')
+      .replace(/>$/, '')
+      .trim();
+    const value = rest.join('|').trim();
+
+    if (!action || !userRef) {
+      return 'Moderation failed: use [moderateUser(action|user|value)].';
+    }
+
+    const member =
+      guild.members.cache.get(userRef) ||
+      guild.members.cache.find(
+        (m) =>
+          m.user.id === userRef ||
+          m.user.tag.toLowerCase() === userRef.toLowerCase() ||
+          m.user.username.toLowerCase() === userRef.toLowerCase() ||
+          (m.displayName || '').toLowerCase() === userRef.toLowerCase()
+      );
+
+    if (!member) {
+      return `Moderation failed: member "${userRef}" not found.`;
+    }
+
+    try {
+      switch (action) {
+        case 'mute':
+        case 'timeout':
+        case 'silence': {
+          const minutes = Number.parseInt(value, 10) || 10;
+          if (minutes < 1 || minutes > 40320) {
+            return 'Mute failed: use minutes between 1 and 40320.';
+          }
+          if (!member.moderatable) {
+            return "Moderation failed: I can't moderate that user (role hierarchy).";
+          }
+          await member.timeout(minutes * 60 * 1000, 'Nya moderation');
+          return `Muted ${member.user.tag} for ${minutes} minute(s).`;
+        }
+        case 'unmute':
+        case 'untimeout':
+        case 'unsilence': {
+          if (!member.moderatable) {
+            return "Moderation failed: I can't moderate that user (role hierarchy).";
+          }
+          await member.timeout(null, 'Nya moderation');
+          return `Unmuted ${member.user.tag}.`;
+        }
+        case 'kick': {
+          if (!member.kickable) {
+            return "Moderation failed: I can't kick that user (role hierarchy).";
+          }
+          await member.kick(value || 'Nya moderation');
+          return `Kicked ${member.user.tag}.`;
+        }
+        case 'ban': {
+          if (!member.bannable) {
+            return "Moderation failed: I can't ban that user (role hierarchy).";
+          }
+          const deleteDays = Number.parseInt(value, 10);
+          const days =
+            Number.isInteger(deleteDays) && deleteDays >= 0 && deleteDays <= 7
+              ? deleteDays
+              : 0;
+          await member.ban({ deleteMessageDays: days, reason: 'Nya moderation' });
+          return `Banned ${member.user.tag}.`;
+        }
+        case 'unban': {
+          const userId = userRef.replace(/\D/g, '');
+          if (!userId) return 'Unban failed: provide a user ID.';
+          await guild.bans.remove(userId, value || 'Nya moderation');
+          return `Unbanned user ${userId}.`;
+        }
+        default:
+          return `Moderation failed: unknown action "${action}".`;
+      }
+    } catch (error) {
+      return `Moderation failed: ${error.message}`;
+    }
+  },
+
   manageChannel: async (context, args) => {
     if (!context.isAdmin) {
       return 'Permission denied: only admins can manage channels.';
@@ -809,6 +904,33 @@ const TOOL_DEFINITIONS = [
   {
     type: 'function',
     function: {
+      name: 'moderateUser',
+      description:
+        'Admin-only moderation: mute/timeout, unmute, kick, ban, or unban users.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            description: 'mute|unmute|kick|ban|unban|timeout|untimeout',
+          },
+          user: {
+            type: 'string',
+            description: 'User ID, mention, tag, or username',
+          },
+          value: {
+            type: 'string',
+            description: 'Minutes for mute/timeout, or reason/delete days',
+          },
+        },
+        required: ['action', 'user'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manageChannel',
       description:
         'Admin-only channel management: rename, set topic, set slowmode, lock, or unlock.',
@@ -860,10 +982,14 @@ Current context:
 ${contextLines}
 
 Tool use:
-Use the provided functions whenever you need live or parameterized data, such as song search, web search, or channel management.
+Use the provided functions whenever you need live or parameterized data, such as song search, web search, moderation, or channel management.
 If function calling is unavailable, you may write a marker on its own line instead and wait for the result:
 - [searchSongs(query)] searches StepMania Online packs.
 - [searchWeb(query)] searches the web with DuckDuckGo.
+- [moderateUser(mute|user|minutes)] timeouts a user (admin only).
+- [moderateUser(unmute|user)] removes timeout (admin only).
+- [moderateUser(kick|user|reason)] kicks a user (admin only).
+- [moderateUser(ban|user|days)] bans a user, optionally delete last N days (admin only).
 - [manageChannel(rename|channel|new-name)] renames a channel (admin only).
 - [manageChannel(topic|channel|new-topic)] sets a channel topic (admin only).
 - [manageChannel(slowmode|channel|seconds)] sets slowmode, 0-21600 (admin only).
@@ -931,6 +1057,7 @@ async function runTool(call, context) {
   if (
     call.name === 'searchSongs' ||
     call.name === 'searchWeb' ||
+    call.name === 'moderateUser' ||
     call.name === 'manageChannel'
   ) {
     return await tool(context, call.arg);
@@ -958,6 +1085,11 @@ async function runNativeTool(call, context) {
 
   if (name === 'searchWeb') {
     return await tools.searchWeb(context, args.query || '');
+  }
+
+  if (name === 'moderateUser') {
+    const parts = [args.action || '', args.user || '', args.value || ''];
+    return await tools.moderateUser(context, parts.join('|'));
   }
 
   if (name === 'manageChannel') {
