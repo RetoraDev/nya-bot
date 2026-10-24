@@ -351,6 +351,180 @@ function appendChatHistory(userId, role, content, limit) {
 }
 
 const SERVER_MEMBERS_LIST_LIMIT = 30;
+const WEB_SEARCH_RESULT_LIMIT = 5;
+
+function decodeHtmlEntities(text) {
+  return String(text)
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;|&#39;|&apos;/g, "'")
+    .replace(/&#x2F;/g, '/')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_, code) =>
+      String.fromCodePoint(Number.parseInt(code, 10))
+    )
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) =>
+      String.fromCodePoint(Number.parseInt(code, 16))
+    );
+}
+
+function stripHtml(html) {
+  return decodeHtmlEntities(String(html).replace(/<[^>]*>/g, ' '))
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeDuckDuckGoUrl(href) {
+  const raw = href.startsWith('//') ? `https:${href}` : href;
+
+  try {
+    const parsed = new URL(raw, 'https://duckduckgo.com');
+    const target = parsed.searchParams.get('uddg');
+    return target ? decodeURIComponent(target) : parsed.toString();
+  } catch {
+    return href;
+  }
+}
+
+async function fetchDuckDuckGoHtml(query) {
+  const response = await fetch(
+    `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+    {
+      headers: {
+        Accept: 'text/html',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'User-Agent':
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(10000),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`DuckDuckGo HTML error: ${response.status}`);
+  }
+
+  const html = await response.text();
+  if (html.includes('anomaly-modal') || html.includes('challenge-form')) {
+    throw new Error('DuckDuckGo returned a bot challenge');
+  }
+
+  const results = [];
+  const blocks = html.split(/<div[^>]*class="[^"]*result[^"]*"/i);
+
+  for (const block of blocks.slice(1)) {
+    const anchor = block.match(
+      /<a[^>]*class="result__a"[^>]*>([\s\S]*?)<\/a>/i
+    );
+    if (!anchor) continue;
+
+    const href = anchor[0].match(/href="([^"]+)"/i);
+    if (!href) continue;
+
+    const snippet =
+      block.match(
+        /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i
+      ) ||
+      block.match(
+        /<div[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/div>/i
+      ) ||
+      block.match(
+        /<td[^>]*class="result-snippet"[^>]*>([\s\S]*?)<\/td>/i
+      );
+
+    const title = stripHtml(anchor[1]);
+    const url = normalizeDuckDuckGoUrl(decodeHtmlEntities(href[1]));
+
+    if (!title || !url) continue;
+
+    results.push({
+      title,
+      url,
+      snippet: snippet ? stripHtml(snippet[1]) : '',
+    });
+
+    if (results.length >= WEB_SEARCH_RESULT_LIMIT) break;
+  }
+
+  return results;
+}
+
+async function fetchDuckDuckGoInstantAnswer(query) {
+  const response = await fetch(
+    `https://api.duckduckgo.com/?q=${encodeURIComponent(
+      query
+    )}&format=json&no_html=1&skip_disambig=1`,
+    {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`DuckDuckGo API error: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const results = [];
+  const seen = new Set();
+
+  const add = (title, url, snippet) => {
+    const key = url || title;
+    if (!key || seen.has(key)) return;
+    if (!title && !snippet) return;
+    seen.add(key);
+    results.push({
+      title: stripHtml(title || query),
+      url,
+      snippet: stripHtml(snippet || ''),
+    });
+  };
+
+  if (data.AbstractText) {
+    add(data.Heading || query, data.AbstractURL, data.AbstractText);
+  }
+  if (data.Answer) {
+    add(data.AnswerType || query, data.AbstractURL, data.Answer);
+  }
+
+  const related = [];
+  const collect = (items) => {
+    for (const item of items || []) {
+      if (Array.isArray(item.Topics)) {
+        collect(item.Topics);
+      } else if (item.Text && item.FirstURL) {
+        related.push(item);
+      }
+    }
+  };
+  collect(data.RelatedTopics);
+
+  for (const item of related) {
+    if (results.length >= WEB_SEARCH_RESULT_LIMIT) break;
+    const [title, ...rest] = item.Text.split(' - ');
+    add(title, item.FirstURL, rest.join(' - ') || item.Text);
+  }
+
+  for (const item of data.Results || []) {
+    if (results.length >= WEB_SEARCH_RESULT_LIMIT) break;
+    add(item.Text, item.FirstURL, item.Text);
+  }
+
+  return results.slice(0, WEB_SEARCH_RESULT_LIMIT);
+}
+
+async function searchDuckDuckGo(query) {
+  try {
+    const htmlResults = await fetchDuckDuckGoHtml(query);
+    if (htmlResults.length > 0) return htmlResults;
+  } catch (error) {
+    console.error('DuckDuckGo HTML search failed:', error.message);
+  }
+
+  return await fetchDuckDuckGoInstantAnswer(query);
+}
 const CHANNEL_LIST_LIMIT = 40;
 
 const CONTEXT_TOOL_NAMES = [
@@ -493,6 +667,29 @@ const tools = {
     }
   },
 
+  searchWeb: async (context, query) => {
+    const term = (query || '').trim();
+    if (!term) return 'Web search failed: no query provided.';
+
+    try {
+      const results = await searchDuckDuckGo(term);
+      if (results.length === 0) {
+        return `No web results found for "${term}".`;
+      }
+
+      const list = results.map((result, index) => {
+        const snippet = result.snippet
+          ? ` - ${truncate(result.snippet, 200)}`
+          : '';
+        return `${index + 1}. ${result.title}${snippet} (${result.url})`;
+      });
+
+      return `Web results for "${term}":\n${list.join('\n')}`;
+    } catch (error) {
+      return `Web search failed: ${error.message}`;
+    }
+  },
+
   manageChannel: async (context, args) => {
     if (!context.isAdmin) {
       return 'Permission denied: only admins can manage channels.';
@@ -593,6 +790,25 @@ const TOOL_DEFINITIONS = [
   {
     type: 'function',
     function: {
+      name: 'searchWeb',
+      description:
+        'Search the web with DuckDuckGo for current information, facts, or links.',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
+            type: 'string',
+            description: 'Search query',
+          },
+        },
+        required: ['query'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'manageChannel',
       description:
         'Admin-only channel management: rename, set topic, set slowmode, lock, or unlock.',
@@ -644,9 +860,10 @@ Current context:
 ${contextLines}
 
 Tool use:
-Use the provided functions whenever you need live or parameterized data, such as song search or channel management.
+Use the provided functions whenever you need live or parameterized data, such as song search, web search, or channel management.
 If function calling is unavailable, you may write a marker on its own line instead and wait for the result:
 - [searchSongs(query)] searches StepMania Online packs.
+- [searchWeb(query)] searches the web with DuckDuckGo.
 - [manageChannel(rename|channel|new-name)] renames a channel (admin only).
 - [manageChannel(topic|channel|new-topic)] sets a channel topic (admin only).
 - [manageChannel(slowmode|channel|seconds)] sets slowmode, 0-21600 (admin only).
@@ -711,7 +928,11 @@ async function runTool(call, context) {
   const tool = tools[call.name];
   if (!tool) return null;
 
-  if (call.name === 'searchSongs' || call.name === 'manageChannel') {
+  if (
+    call.name === 'searchSongs' ||
+    call.name === 'searchWeb' ||
+    call.name === 'manageChannel'
+  ) {
     return await tool(context, call.arg);
   }
 
@@ -733,6 +954,10 @@ async function runNativeTool(call, context) {
 
   if (name === 'searchSongs') {
     return await tools.searchSongs(context, args.query || '');
+  }
+
+  if (name === 'searchWeb') {
+    return await tools.searchWeb(context, args.query || '');
   }
 
   if (name === 'manageChannel') {
@@ -1522,3 +1747,5 @@ client.on(Events.InteractionCreate, async (interaction) => {
 });
 
 client.login(DISCORD_TOKEN);
+
+module.exports = { searchDuckDuckGo, fetchDuckDuckGoHtml, fetchDuckDuckGoInstantAnswer };
