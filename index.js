@@ -25,9 +25,9 @@ const CONTRIBUTOR_POST_LIMIT = 10;
 const CONTRIBUTOR_CHANNEL_NAMES = ['bug-reports', 'feature-requests'];
 
 const CHAT_HISTORY_LIMIT_USER = 8;
-const CHAT_HISTORY_LIMIT_ADMIN = 25;
+const CHAT_HISTORY_LIMIT_ADMIN = 15;
 
-const WELCOME_CHANNEL_NAME = 'general';
+const WELCOME_CHANNEL_NAME = 'announcements';
 const WELCOME_RATE_LIMIT = 3;
 const WELCOME_RATE_WINDOW_MS = 60 * 1000;
 
@@ -283,11 +283,14 @@ const SEARCH_SESSION_TTL = 15 * 60 * 1000;
 
 const searchSessions = new Map();
 
-const NYA_SYSTEM_PROMPT =
-  'You are Nya, a ~20 years old otaku girl who loves anime, games, and cute things. ' +
-  'You speak casually, playful but kind. Keep responses short and natural. ' +
-  'Use cute text like ^^, :3, and similar when fitting, but never use emojis. ' +
-  'Stay in character at all times.';
+const NYA_SYSTEM_PROMPT =  `You are Nya, a Discord bot created by Retora as a ~20 years old otaku girl who loves anime, games, and cute things.
+You speak casually, playful but kind. Keep responses short and natural.
+Use cute text like ^^, :3, and similar when fitting, but never use emojis.
+Stay in character at all times.
+
+Your task to help managing the PadManiacs community.
+PadManiaX is a lightweight rhythm game created by Retora too. 
+It brings the StepMania experience to web and mobile devices with a retro pixel art aesthetic. The game features core rhythm gameplay mechanics of StepMania`;
 
 const NYA_WELCOME_PROMPT =
   'You are Nya, a ~20 years old otaku girl who loves anime, games, and cute things. ' +
@@ -333,8 +336,6 @@ async function askNya(userMessage, userId, isAdmin = false) {
   }
 
   const limit = isAdmin ? CHAT_HISTORY_LIMIT_ADMIN : CHAT_HISTORY_LIMIT_USER;
-  appendChatHistory(userId, 'user', userMessage, limit);
-
   const history = getUserChatHistory(userId);
 
   try {
@@ -351,6 +352,7 @@ async function askNya(userMessage, userId, isAdmin = false) {
           messages: [
             { role: 'system', content: NYA_SYSTEM_PROMPT },
             ...history,
+            { role: 'user', content: userMessage },
           ],
         }),
         signal: AbortSignal.timeout(15000),
@@ -376,6 +378,7 @@ async function askNya(userMessage, userId, isAdmin = false) {
     }
 
     const reply = content.trim() || '...';
+    appendChatHistory(userId, 'user', userMessage, limit);
     appendChatHistory(userId, 'assistant', reply, limit);
 
     return reply;
