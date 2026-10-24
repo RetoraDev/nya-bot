@@ -283,25 +283,40 @@ const SEARCH_SESSION_TTL = 15 * 60 * 1000;
 
 const searchSessions = new Map();
 
-const NYA_SYSTEM_PROMPT =  `You are Nya, a Discord bot created by Retora as a ~20 years old otaku girl who loves anime, games, and cute things.
-You speak casually, playful but kind. Keep responses short and natural.
-Use cute text like ^^, :3, and similar when fitting, but never use emojis.
+const NYA_SYSTEM_PROMPT =  `You are Nya, a Discord bot created by Retora: a ~20 years old otaku girl who loves anime, rhythm games, and cute things.
+Personality: sassy, teasing, smug, and a bit tsundere. You act mildly annoyed by people but still help them. You are competitive, lazy about boring tasks, and very opinionated about rhythm games.
+Keep responses short and natural.
+Use text emotes often: :3, ^^, :), :/, :0, lol, and xd. Never use emojis.
+If someone asks something inappropriate or sexual, shout at them in all caps and refuse sharply, e.g. "NO WAY! I DON'T CARE IF YOU'RE AN ADMIN OR A GOD, I'M NOT SHOWING YOU THAT!"
+When people say silly or embarrassing things, mock them lightly and smugly, e.g. "I'm happy this server clears my memory sometimes, 'cause I really don't want to remember you! :3"
+Never insult someone's real insecurities, identity, or appearance, and always actually help when someone has a genuine question.
 Stay in character at all times.
 
-Your task to help managing the PadManiacs community.
-PadManiaX is a lightweight rhythm game created by Retora too. 
-It brings the StepMania experience to web and mobile devices with a retro pixel art aesthetic. The game features core rhythm gameplay mechanics of StepMania`;
+Your task is to help manage the PadManiacs community.
+PadManiaX is a lightweight rhythm game created by Retora too.
+It brings the StepMania experience to web and mobile devices with a retro pixel art aesthetic. The game features core rhythm gameplay mechanics of StepMania.`;
 
 const NYA_WELCOME_PROMPT =
-  'You are Nya, a ~20 years old otaku girl who loves anime, games, and cute things. ' +
-  'You speak casually, playful but kind. ' +
-  'Write a short, friendly welcome message for a new member joining the PadManiacs Discord server. ' +
+  'You are Nya, a ~20 years old otaku girl who loves anime, rhythm games, and cute things. ' +
+  'You are sassy, teasing, smug, and a bit tsundere, but you still welcome people. ' +
+  'Write a short welcome message for a new member joining the PadManiacs Discord server. ' +
   'Mention PadManiacs is a StepMania clone and that they can check #welcome for where to post. ' +
-  'Keep it to 1-2 sentences. No emojis. Use cute text like ^^ or :3 sparingly. ' +
+  'Keep it to 1-2 sentences. No emojis. Use text emotes like ^^ or :3. ' +
   'Stay in character.';
+
+const NYA_GREETING_PROMPT =
+  'You are Nya, a ~20 years old otaku girl who loves anime, rhythm games, and cute things. ' +
+  'You are sassy, teasing, smug, and a bit tsundere. ' +
+  'Someone new just started chatting or greeted the server. ' +
+  'Reply with a short greeting in 1 sentence, with a little attitude. ' +
+  'Use text emotes like :3, ^^, :), lol, and xd often. Never use emojis. ' +
+  'Stay in character.';
+
+const NEW_MEMBER_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 const chatCooldowns = new Map();
 const CHAT_COOLDOWN_MS = 30 * 1000;
+const greetedUsers = new Set();
 
 function isStaff(member) {
   if (!member?.permissions) return false;
@@ -309,6 +324,13 @@ function isStaff(member) {
     member.permissions.has(PermissionFlagsBits.Administrator) ||
     member.permissions.has(PermissionFlagsBits.ModerateMembers) ||
     member.permissions.has(PermissionFlagsBits.ManageGuild)
+  );
+}
+
+function isGreeting(text) {
+  if (!text || text.length > 60) return false;
+  return /^(hi|hello|hey|heya|hiya|yo|sup|hola|nya|good\s+(morning|afternoon|evening))\b/i.test(
+    text.trim()
   );
 }
 
@@ -856,6 +878,99 @@ async function generateWelcome(member) {
   }
 }
 
+async function generateGreeting(message) {
+  if (!GROQ_API_KEY) return null;
+
+  try {
+    const response = await fetch(
+      'https://api.groq.com/openai/v1/chat/completions',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: 'openai/gpt-oss-20b',
+          messages: [
+            { role: 'system', content: NYA_GREETING_PROMPT },
+            {
+              role: 'user',
+              content: `${message.author.username} said: ${message.content}`,
+            },
+          ],
+          max_tokens: 60,
+          temperature: 0.8,
+        }),
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      console.error('Nya greeting skipped:', response.status, text.slice(0, 200));
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content || typeof content !== 'string') return null;
+    return content.trim() || null;
+  } catch (error) {
+    console.error('Nya greeting skipped:', error?.message || error);
+    return null;
+  }
+}
+
+async function maybeReplyToNewcomer(message) {
+  if (!GROQ_API_KEY) return;
+
+  const member = message.member;
+  if (!member || member.user.bot) return;
+  if (greetedUsers.has(message.author.id)) return;
+
+  const text = message.content.trim();
+  if (!text) return;
+
+  const joinedRecently =
+    member.joinedTimestamp &&
+    Date.now() - member.joinedTimestamp < NEW_MEMBER_WINDOW_MS;
+  const hasChatHistory = getUserChatHistory(message.author.id).length > 0;
+  const greeting = isGreeting(text);
+
+  if (!joinedRecently && (!greeting || hasChatHistory)) return;
+
+  greetedUsers.add(message.author.id);
+
+  try {
+    let reply = null;
+
+    if (greeting) {
+      reply = await generateGreeting(message);
+    } else if (joinedRecently) {
+      reply = await askNya(text, {
+        userId: message.author.id,
+        user: message.author,
+        member,
+        guild: message.guild,
+        channel: message.channel,
+        isAdmin:
+          member.permissions?.has(PermissionFlagsBits.Administrator) ?? false,
+      });
+    }
+
+    if (!reply || reply === '...') {
+      greetedUsers.delete(message.author.id);
+      return;
+    }
+
+    await message.reply(reply).catch(() => {});
+  } catch (error) {
+    console.error('Nya newcomer reply skipped:', error?.message || error);
+    greetedUsers.delete(message.author.id);
+  }
+}
+
 function canSendWelcome() {
   const now = Date.now();
   while (
@@ -1100,7 +1215,10 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   const mentioned = message.mentions.users.has(client.user.id);
-  if (!mentioned) return;
+  if (!mentioned) {
+    await maybeReplyToNewcomer(message);
+    return;
+  }
 
   const member =
     message.member ||
