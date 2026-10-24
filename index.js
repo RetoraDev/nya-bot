@@ -1066,6 +1066,23 @@ async function runTool(call, context) {
   return await tool(context);
 }
 
+function sanitizeJsonString(str) {
+  if (typeof str !== 'string') return '{}';
+  let s = str.trim();
+  if (!s) return '{}';
+  // If truncated mid-quote
+  const quoteCount = (s.match(/"/g) || []).length;
+  if (quoteCount % 2 !== 0) s += '"';
+  // Try to close braces/brackets
+  const openBraces = (s.match(/\{/g) || []).length - (s.match(/\}/g) || []).length;
+  for (let i = 0; i < openBraces; i += 1) s += '}';
+  const openBrackets = (s.match(/\[/g) || []).length - (s.match(/\]/g) || []).length;
+  for (let i = 0; i < openBrackets; i += 1) s += ']';
+  // Fix trailing commas before } or ]
+  s = s.replace(/,\s*([}\]])/g, '$1');
+  return s;
+}
+
 async function runNativeTool(call, context) {
   const name = call.function?.name;
   if (!Object.prototype.hasOwnProperty.call(tools, name)) {
@@ -1076,24 +1093,31 @@ async function runNativeTool(call, context) {
   try {
     args = JSON.parse(call.function?.arguments || '{}');
   } catch {
-    args = {};
+    try {
+      args = JSON.parse(sanitizeJsonString(call.function?.arguments || '{}'));
+    } catch {
+      args = {};
+    }
   }
 
   if (name === 'searchSongs') {
-    return await tools.searchSongs(context, args.query || '');
+    const query =
+      args.query || args.term || args.q || args.search || '';
+    return await tools.searchSongs(context, String(query));
   }
 
   if (name === 'searchWeb') {
-    return await tools.searchWeb(context, args.query || '');
+    const query = args.query || args.q || args.term || args.search || '';
+    return await tools.searchWeb(context, String(query));
   }
 
   if (name === 'moderateUser') {
-    const parts = [args.action || '', args.user || '', args.value || ''];
+    const parts = [args.action || '', args.user || args.member || '', args.value || args.reason || ''];
     return await tools.moderateUser(context, parts.join('|'));
   }
 
   if (name === 'manageChannel') {
-    const parts = [args.action || '', args.channel || '', args.value || ''];
+    const parts = [args.action || '', args.channel || '', args.value || args.topic || args.name || ''];
     return await tools.manageChannel(context, parts.join('|'));
   }
 
