@@ -1462,7 +1462,6 @@ async function searchStepmania(query) {
 }
 
 async function refreshAutoroles(guild) {
-  await cleanStepmaniaSearchMessages(guild);
   await syncEarlyBirdRoles(guild);
 
   const counts = await buildContributorCounts(guild);
@@ -1557,6 +1556,47 @@ function buildSearchMessage(session, page) {
   }
 
   return { embeds: [embed], components };
+}
+
+async function cleanStepmaniaSearchMessages(guild) {
+  if (!guild) return;
+  const toDelete = [];
+
+  for (const channel of guild.channels.cache.values()) {
+    if (!channel.isTextBased?.() || channel.isThread?.()) continue;
+    try {
+      const messages = await channel.messages.fetch({ limit: 50 });
+      for (const [id, msg] of messages) {
+        if (stepmaniaSearchMessageIds.has(id)) {
+          toDelete.push({ channel, id });
+          continue;
+        }
+        if (msg.author?.id === client.user?.id) {
+          const embeds = msg.embeds || [];
+          if (
+            embeds.some(
+              (e) =>
+                e.footer?.text?.includes('StepMania Online') ||
+                e.title?.includes('StepMania results')
+            )
+          ) {
+            toDelete.push({ channel, id });
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Failed to scan channel for search messages:', error);
+    }
+  }
+
+  for (const item of toDelete) {
+    try {
+      await item.channel.messages.delete(item.id).catch(() => null);
+    } catch {
+      // ignore
+    }
+    stepmaniaSearchMessageIds.delete(item.id);
+  }
 }
 
 const client = new Client({
