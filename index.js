@@ -1,5 +1,37 @@
 require('dotenv').config();
 
+const CRON_JOB_API_KEY = process.env.CRON_JOB_API_KEY;
+const CRON_JOB_ID = process.env.CRON_JOB_ID || '8716243';
+
+async function ensureCronJobRunning() {
+  if (!CRON_JOB_API_KEY) return;
+  try {
+    const res = await fetch(
+      `https://api.cron-job.org/jobs/${CRON_JOB_ID}`,
+      {
+        headers: {
+          Authorization: `Bearer ${CRON_JOB_API_KEY}`,
+        },
+        signal: AbortSignal.timeout(10000),
+      }
+    );
+    if (!res.ok) return;
+    const data = await res.json();
+    const job = data?.job || data;
+    const enabled = job?.enabled === true || job?.status === 'enabled';
+    if (enabled) return;
+    await fetch(`https://api.cron-job.org/jobs/${CRON_JOB_ID}/run`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${CRON_JOB_API_KEY}`,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (err) {
+    console.error('cron-job check failed:', err.message);
+  }
+}
+
 const {
   Client,
   Events,
@@ -44,6 +76,7 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT || 3000, () => {
   console.log(`Keep-alive server listening on port ${PORT || 3000}`);
+  ensureCronJobRunning();
 });
 
 if (!DISCORD_TOKEN || !CLIENT_ID || !GUILD_ID) {
